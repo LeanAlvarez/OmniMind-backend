@@ -2,12 +2,13 @@
 
 import logging
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import httpx
 
 from src.core.config import settings
 from src.core.schemas import AgentState
+from src.core.utils import validate_and_fix_date
 from src.services.supabase_service import supabase_service
 
 logger = logging.getLogger(__name__)
@@ -130,6 +131,87 @@ def save_node(state: AgentState) -> Dict[str, Any]:
         
         # persist to supabase via service
         inserted_item = supabase_service.insert_item(item_data)
+        item_id = inserted_item.get("id")
+        
+        # insert reminders if present
+        processed_data = state.get("processed_data", {})
+        reminders = processed_data.get("reminders", [])
+        
+        # fallback: if expiry_date exists but reminders is empty, create one reminder
+        if (not reminders or not isinstance(reminders, list) or len(reminders) == 0) and item_id:
+            expiry_date = processed_data.get("expiry_date")
+            if expiry_date:
+                logger.info(f"no reminders found, creating fallback reminder from expiry_date: {expiry_date}")
+                # try to get total amount from processed_data
+                total_amount = None
+                # look for common amount field names
+                for amount_key in ["total_amount", "amount", "total", "monto_total"]:
+                    if amount_key in processed_data:
+                        total_amount = processed_data.get(amount_key)
+                        break
+                
+                # validate and fix expiry_date before creating reminder
+                fixed_expiry_date = validate_and_fix_date(expiry_date)
+                if fixed_expiry_date:
+                    # create fallback reminder
+                    reminders = [{
+                        "label": "vencimiento único",
+                        "due_date": fixed_expiry_date,
+                        "amount": total_amount,
+                    }]
+                else:
+                    logger.warning(f"could not validate expiry_date for fallback reminder: {expiry_date}")
+        
+        if reminders and isinstance(reminders, list) and item_id:
+            logger.info(f"inserting {len(reminders)} reminders for item {item_id}")
+            for reminder in reminders:
+                if isinstance(reminder, dict):
+                    # validate due_date before creating reminder_data
+                    reminder_due_date = reminder.get("due_date")
+                    if not reminder_due_date:
+                        # try to use item's global expiry_date as fallback
+                        expiry_date = processed_data.get("expiry_date")
+                        if expiry_date:
+                            fixed_date = validate_and_fix_date(expiry_date)
+                            if fixed_date:
+                                reminder_due_date = fixed_date
+                                logger.info(f"using expiry_date as fallback for reminder: {fixed_date}")
+                            else:
+                                logger.warning(f"reminder has no valid due_date and expiry_date fallback failed: {reminder}")
+                                continue
+                        else:
+                            logger.warning(f"reminder has no due_date and no expiry_date fallback available: {reminder}")
+                            continue
+                    else:
+                        # validate and fix the reminder's due_date
+                        reminder_due_date = validate_and_fix_date(reminder_due_date)
+                        if not reminder_due_date:
+                            # try expiry_date as fallback
+                            expiry_date = processed_data.get("expiry_date")
+                            if expiry_date:
+                                reminder_due_date = validate_and_fix_date(expiry_date)
+                                if reminder_due_date:
+                                    logger.info(f"fixed reminder due_date using expiry_date fallback: {reminder_due_date}")
+                                else:
+                                    logger.warning(f"reminder due_date invalid and expiry_date fallback failed: {reminder}")
+                                    continue
+                            else:
+                                logger.warning(f"reminder due_date invalid and no expiry_date fallback: {reminder}")
+                                continue
+                    
+                    reminder_data = {
+                        "item_id": item_id,
+                        "label": reminder.get("label"),
+                        "due_date": _format_expiry_date(reminder_due_date),
+                        "amount": reminder.get("amount"),
+                    }
+                    # remove None values (but keep due_date as it's required)
+                    reminder_data = {k: v for k, v in reminder_data.items() if k == "due_date" or v is not None}
+                    
+                    try:
+                        supabase_service.insert_reminder(reminder_data)
+                    except Exception as e:
+                        logger.warning(f"error inserting reminder: {str(e)}")
         
         # call n8n webhook if needed (fire and forget)
         # note: langgraph nodes are sync, so we'll use httpx sync for now

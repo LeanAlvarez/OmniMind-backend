@@ -50,3 +50,4 @@ def perform_search(query: str) -> str:
         logger.error(f"error performing search: {str(e)}", exc_info=True)
         return ""
 
+
